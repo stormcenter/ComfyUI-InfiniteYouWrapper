@@ -10,6 +10,8 @@ from insightface.app import FaceAnalysis
 from insightface.utils import face_align
 from facexlib.recognition import init_recognition_model
 import folder_paths
+from diffusers.models import FluxControlNetModel
+from diffusers.models.embeddings import CombinedTimestepGuidanceTextProjEmbeddings, CombinedTimestepTextProjEmbeddings, FluxPosEmbed
 
 # Add local InfiniteYou project to path to import its modules
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "InfiniteYou"))
@@ -242,6 +244,75 @@ class LoadInfuModel:
         return (infu_model,)
 
 
+# 首先创建一个扩展的 FluxControlNetModel 类
+class AdvancedFluxControlNetModel(FluxControlNetModel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.previous_controlnet = None
+        self.control_hint = None
+        self.strength = 1.0
+        self.start_percent = 0.0
+        self.end_percent = 1.0
+
+    def set_cond_hint(self, control_hint, strength, start_percent_end_percent, vae=None):
+        self.control_hint = control_hint
+        self.strength = strength
+        self.start_percent, self.end_percent = start_percent_end_percent
+        return self
+
+    def set_previous_controlnet(self, prev_cnet):
+        self.previous_controlnet = prev_cnet
+        return self
+
+    def copy(self):
+        new_model = AdvancedFluxControlNetModel(*self._args, **self._kwargs)
+        new_model.load_state_dict(self.state_dict())
+        return new_model
+
+    def verify_all_weights(self):
+        return True
+
+    def disarm(self):
+        return self
+
+    def get_models(self):
+        return [self]
+
+    def inference_memory_requirements(self, dtype):
+        param_size = sum(p.numel() * p.element_size() for p in self.parameters())
+        buffer_size = 2 * 1024 * 1024 * 1024  # 2GB 缓冲区
+        return param_size + buffer_size
+
+    def forward(
+        self,
+        hidden_states,
+        controlnet_cond,
+        controlnet_mode=None,
+        conditioning_scale=1.0,
+        timestep=None,
+        guidance=None,
+        pooled_projections=None,
+        encoder_hidden_states=None,
+        txt_ids=None,
+        img_ids=None,
+        joint_attention_kwargs=None,
+        return_dict=True,
+    ):
+        return super().forward(
+            hidden_states=hidden_states,
+            controlnet_cond=controlnet_cond,
+            controlnet_mode=controlnet_mode,
+            conditioning_scale=conditioning_scale,
+            timestep=timestep,
+            guidance=guidance,
+            pooled_projections=pooled_projections,
+            encoder_hidden_states=encoder_hidden_states,
+            txt_ids=txt_ids,
+            img_ids=img_ids,
+            joint_attention_kwargs=joint_attention_kwargs,
+            return_dict=return_dict,
+        )
+
 # Define ComfyUI node for applying InfiniteYou model
 class ApplyInfu:
     @classmethod
@@ -270,8 +341,6 @@ class ApplyInfu:
     def process(self, positive, negative, infu_model, face_analyzers, id_image,
                infusenet_conditioning_scale, infusenet_guidance_start, 
                infusenet_guidance_end, control_image=None):
-        from diffusers.models import FluxControlNetModel
-        
         # 提取模型组件
         image_proj_model = infu_model["image_proj_model"]
         infusenet_path = infu_model["infusenet_path"]
@@ -283,7 +352,7 @@ class ApplyInfu:
         arcface_model = face_analyzers["arcface_model"]
         
         # 加载 InfuseNet ControlNet 模型
-        infusenet = FluxControlNetModel.from_pretrained(infusenet_path, torch_dtype=torch.bfloat16)
+        infusenet = AdvancedFluxControlNetModel.from_pretrained(infusenet_path, torch_dtype=torch.bfloat16)
         infusenet.to("cuda")
         
         # 转换 ID 图像为 PIL 格式
@@ -376,10 +445,10 @@ class ApplyInfu:
                 d['control_guidance_start'] = infusenet_guidance_start
                 d['control_guidance_end'] = infusenet_guidance_end
                 
-                # 添加 Advanced-ControlNet 兼容性
-                d['previous_controlnet'] = None  # 添加这个属性
-                d['control_model'] = infusenet  # 添加这个属性
-                d['control_image'] = control_image_tensor  # 添加这个属性
+                # 添加必要的控制参数
+                d['control_hint'] = control_image_tensor if control_image_tensor is not None else None
+                d['control_strength'] = infusenet_conditioning_scale
+                d['control_start_stop'] = (infusenet_guidance_start, infusenet_guidance_end)
                 
                 n = [t[0], d]
                 c.append(n)

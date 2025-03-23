@@ -247,8 +247,6 @@ class LoadInfuModel:
 # 首先创建一个扩展的 FluxControlNetModel 类
 class AdvancedFluxControlNetModel(FluxControlNetModel):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        
         # 基本的 Advanced-ControlNet 接口属性
         self.previous_controlnet = None
         self.control_hint = None
@@ -262,12 +260,109 @@ class AdvancedFluxControlNetModel(FluxControlNetModel):
         
         # 添加 flux 相关的属性
         self.guidance_scale = 1.0
-        self.guidance_embeds = False  # 从配置中获取
+        self.guidance_embeds = True
         self.controlnet_cond = None
         self.controlnet_mode = None
         self.txt_ids = None
         self.img_ids = None
         self.joint_attention_kwargs = None
+
+        # 在调用父类初始化之前，确保配置中包含正确的时间投影层类型
+        if 'config' in kwargs:
+            config = kwargs['config']
+            config.time_embedding_type = 'flux_guidance'  # 确保使用正确的时间嵌入类型
+            config.guidance_embeds = True  # 启用引导嵌入
+            
+            # 创建正确的时间投影层
+            embedding_dim = getattr(config, "embedding_dim", 1280)
+            kwargs['time_proj'] = CombinedTimestepGuidanceTextProjEmbeddings(
+                embedding_dim=embedding_dim,
+                pooled_projection_dim=embedding_dim  # 设置为与 embedding_dim 相同
+            )
+        
+        super().__init__(*args, **kwargs)
+
+    # 添加 get_extra_hooks 方法
+    def get_extra_hooks(self):
+        return {
+            "controlnet_cond": self.controlnet_cond,
+            "controlnet_mode": self.controlnet_mode,
+            "txt_ids": self.txt_ids,
+            "img_ids": self.img_ids,
+            "joint_attention_kwargs": self.joint_attention_kwargs,
+        }
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_path, **kwargs):
+        print(f"Loading model from {pretrained_model_path}")
+        print(f"Original kwargs: {kwargs}")
+        
+        # 创建基本配置
+        config_dict = {
+            'time_embedding_type': 'flux_guidance',
+            'guidance_embeds': True,
+            'embedding_dim': 1280  # 默认值
+        }
+        
+        # 创建时间投影层
+        embedding_dim = config_dict['embedding_dim']
+        time_proj = CombinedTimestepGuidanceTextProjEmbeddings(
+            embedding_dim=embedding_dim,
+            pooled_projection_dim=embedding_dim  # 设置为与 embedding_dim 相同
+        )
+        
+        # # 从 kwargs 中移除可能存在的 config
+        # if 'config' in kwargs:
+        #     print("Removing config from kwargs")
+        #     kwargs.pop('config')
+        
+        # # 准备新的 kwargs
+        # new_kwargs = {
+        #     'time_proj': time_proj,
+        #     **kwargs
+        # }
+        # print(f"New kwargs: {new_kwargs}")
+        
+        try:
+            # 使用父类的 from_pretrained 方法加载模型
+            base_model = FluxControlNetModel.from_pretrained(
+                pretrained_model_path,
+                **kwargs
+            )
+            print("Base model loaded successfully")
+            
+            # 创建我们的高级模型实例
+            model = cls()
+            
+            # 复制基础模型的状态
+            model.load_state_dict(base_model.state_dict())
+            
+            # 设置配置
+            model.config = base_model.config
+            for key, value in config_dict.items():
+                setattr(model.config, key, value)
+            
+            # 复制其他必要的属性
+            model.dtype = base_model.dtype
+            model.device = base_model.device
+            model.time_proj = base_model.time_proj
+            
+            # 设置默认属性
+            model.guidance_scale = 1.0
+            model.guidance_embeds = True
+            model.controlnet_cond = None
+            model.controlnet_mode = None
+            model.txt_ids = None
+            model.img_ids = None
+            model.joint_attention_kwargs = None
+            
+            print("Advanced model created successfully")
+            return model
+            
+        except Exception as e:
+            print(f"Error loading model: {str(e)}")
+            print(f"Error type: {type(e)}")
+            raise
 
     def set_cond_hint(self, control_hint, strength, start_percent_end_percent, vae=None):
         self.control_hint = control_hint
@@ -310,43 +405,8 @@ class AdvancedFluxControlNetModel(FluxControlNetModel):
     def get_models(self):
         return [self]
 
-    def forward(
-        self,
-        hidden_states,
-        controlnet_cond,
-        controlnet_mode=None,
-        conditioning_scale=1.0,
-        timestep=None,
-        guidance=None,
-        pooled_projections=None,
-        encoder_hidden_states=None,
-        txt_ids=None,
-        img_ids=None,
-        joint_attention_kwargs=None,
-        return_dict=True,
-    ):
-        # 保存当前的参数
-        self.controlnet_cond = controlnet_cond
-        self.controlnet_mode = controlnet_mode
-        self.txt_ids = txt_ids
-        self.img_ids = img_ids
-        self.joint_attention_kwargs = joint_attention_kwargs
-
-        # 使用父类的 forward 实现
-        return super().forward(
-            hidden_states=hidden_states,
-            controlnet_cond=controlnet_cond,
-            controlnet_mode=controlnet_mode,
-            conditioning_scale=conditioning_scale,
-            timestep=timestep,
-            guidance=guidance,
-            pooled_projections=pooled_projections,
-            encoder_hidden_states=encoder_hidden_states,
-            txt_ids=txt_ids,
-            img_ids=img_ids,
-            joint_attention_kwargs=joint_attention_kwargs,
-            return_dict=return_dict,
-        )
+    def forward(self, *args, **kwargs):
+        return super().forward(*args, **kwargs)
 
 # Define ComfyUI node for applying InfiniteYou model
 class ApplyInfu:

@@ -248,11 +248,26 @@ class LoadInfuModel:
 class AdvancedFluxControlNetModel(FluxControlNetModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        
+        # 基本的 Advanced-ControlNet 接口属性
         self.previous_controlnet = None
         self.control_hint = None
         self.strength = 1.0
         self.start_percent = 0.0
         self.end_percent = 1.0
+
+        # 参考 pulidflux.py 的实现，添加必要的属性
+        self.double_interval = 2
+        self.single_interval = 4
+        
+        # 添加 flux 相关的属性
+        self.guidance_scale = 1.0
+        self.guidance_embeds = False  # 从配置中获取
+        self.controlnet_cond = None
+        self.controlnet_mode = None
+        self.txt_ids = None
+        self.img_ids = None
+        self.joint_attention_kwargs = None
 
     def set_cond_hint(self, control_hint, strength, start_percent_end_percent, vae=None):
         self.control_hint = control_hint
@@ -267,6 +282,23 @@ class AdvancedFluxControlNetModel(FluxControlNetModel):
     def copy(self):
         new_model = AdvancedFluxControlNetModel(*self._args, **self._kwargs)
         new_model.load_state_dict(self.state_dict())
+        
+        # 复制基本属性
+        new_model.previous_controlnet = self.previous_controlnet
+        new_model.control_hint = self.control_hint
+        new_model.strength = self.strength
+        new_model.start_percent = self.start_percent
+        new_model.end_percent = self.end_percent
+        
+        # 复制 flux 相关属性
+        new_model.guidance_scale = self.guidance_scale
+        new_model.guidance_embeds = self.guidance_embeds
+        new_model.controlnet_cond = self.controlnet_cond
+        new_model.controlnet_mode = self.controlnet_mode
+        new_model.txt_ids = self.txt_ids
+        new_model.img_ids = self.img_ids
+        new_model.joint_attention_kwargs = self.joint_attention_kwargs
+        
         return new_model
 
     def verify_all_weights(self):
@@ -277,11 +309,6 @@ class AdvancedFluxControlNetModel(FluxControlNetModel):
 
     def get_models(self):
         return [self]
-
-    def inference_memory_requirements(self, dtype):
-        param_size = sum(p.numel() * p.element_size() for p in self.parameters())
-        buffer_size = 2 * 1024 * 1024 * 1024  # 2GB 缓冲区
-        return param_size + buffer_size
 
     def forward(
         self,
@@ -298,6 +325,14 @@ class AdvancedFluxControlNetModel(FluxControlNetModel):
         joint_attention_kwargs=None,
         return_dict=True,
     ):
+        # 保存当前的参数
+        self.controlnet_cond = controlnet_cond
+        self.controlnet_mode = controlnet_mode
+        self.txt_ids = txt_ids
+        self.img_ids = img_ids
+        self.joint_attention_kwargs = joint_attention_kwargs
+
+        # 使用父类的 forward 实现
         return super().forward(
             hidden_states=hidden_states,
             controlnet_cond=controlnet_cond,
@@ -319,6 +354,7 @@ class ApplyInfu:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "model": ("MODEL",),
                 "positive": ("CONDITIONING", ),
                 "negative": ("CONDITIONING", ),
                 "infu_model": ("INFU_MODEL", ),
@@ -333,12 +369,12 @@ class ApplyInfu:
             }
         }
 
-    RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
-    RETURN_NAMES = ("positive", "negative")
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("model", "positive", "negative")
     FUNCTION = "process"
     CATEGORY = "InfiniteYou"
 
-    def process(self, positive, negative, infu_model, face_analyzers, id_image,
+    def process(self, model, positive, negative, infu_model, face_analyzers, id_image,
                infusenet_conditioning_scale, infusenet_guidance_start, 
                infusenet_guidance_end, control_image=None):
         # 提取模型组件
@@ -354,6 +390,9 @@ class ApplyInfu:
         # 加载 InfuseNet ControlNet 模型
         infusenet = AdvancedFluxControlNetModel.from_pretrained(infusenet_path, torch_dtype=torch.bfloat16)
         infusenet.to("cuda")
+        
+        # 将 controlnet 添加到 model 中
+        model.model.controlnet = infusenet
         
         # 转换 ID 图像为 PIL 格式
         if isinstance(id_image, torch.Tensor):
@@ -454,7 +493,7 @@ class ApplyInfu:
                 c.append(n)
             out.append(c)
         
-        return (out[0], out[1])
+        return (model, out[0], out[1])
 
 
 # Node for creating InfiniteYou conditioning parameters

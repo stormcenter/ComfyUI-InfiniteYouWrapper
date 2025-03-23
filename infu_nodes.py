@@ -15,19 +15,14 @@ import folder_paths
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "InfiniteYou"))
 
 # Import Resampler model
-class FeedForward(nn.Module):
-    def __init__(self, dim, mult=4):
-        super().__init__()
-        inner_dim = int(dim * mult)
-        self.net = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, inner_dim, bias=False),
-            nn.GELU(),
-            nn.Linear(inner_dim, dim, bias=False),
-        )
-    
-    def forward(self, x):
-        return self.net(x)
+def FeedForward(dim, mult=4):
+    inner_dim = int(dim * mult)
+    return nn.Sequential(
+        nn.LayerNorm(dim),
+        nn.Linear(dim, inner_dim, bias=False),
+        nn.GELU(),
+        nn.Linear(inner_dim, dim, bias=False),
+    )
 
 def reshape_tensor(x, heads):
     bs, length, width = x.shape
@@ -192,7 +187,6 @@ class LoadInfuModel:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model_path": ("STRING", {"default": "./models/InfiniteYou"}),
                 "infu_flux_version": (["v1.0"], {"default": "v1.0"}),
                 "model_version": (["aes_stage2", "sim_stage1"], {"default": "aes_stage2"}),
             },
@@ -203,33 +197,14 @@ class LoadInfuModel:
     FUNCTION = "load_model"
     CATEGORY = "InfiniteYou"
 
-    def load_model(self, model_path, infu_flux_version, model_version):
-        # Prepare paths
+    def load_model(self, infu_flux_version, model_version):
+        # 准备路径
+        model_path = os.path.join(folder_paths.models_dir, "InfiniteYou")
         infu_model_path = os.path.join(model_path, f"infu_flux_{infu_flux_version}", model_version)
         infusenet_path = os.path.join(infu_model_path, 'InfuseNetModel')
         image_proj_model_path = os.path.join(infu_model_path, 'image_proj_model.bin')
-        insightface_root_path = os.path.join(model_path, 'supports', 'insightface')
         
-        # Load InsightFace models
-        app_640 = FaceAnalysis(name='antelopev2', 
-                          root=insightface_root_path, 
-                          providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        app_640.prepare(ctx_id=0, det_size=(640, 640))
-        
-        app_320 = FaceAnalysis(name='antelopev2', 
-                          root=insightface_root_path, 
-                          providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        app_320.prepare(ctx_id=0, det_size=(320, 320))
-        
-        app_160 = FaceAnalysis(name='antelopev2', 
-                          root=insightface_root_path, 
-                          providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        app_160.prepare(ctx_id=0, det_size=(160, 160))
-        
-        # Load ArcFace model
-        arcface_model = init_recognition_model('arcface', device='cuda')
-        
-        # Load image projection model
+        # 加载图像投影模型
         num_tokens = 8  # image_proj_num_tokens
         image_emb_dim = 512
         image_proj_model = Resampler(
@@ -243,21 +218,20 @@ class LoadInfuModel:
             ff_mult=4,
         )
         
+        # 加载权重
         ipm_state_dict = torch.load(image_proj_model_path, map_location="cpu")
-        image_proj_model.load_state_dict(ipm_state_dict['image_proj'])
+        if 'image_proj' in ipm_state_dict:
+            state_dict = ipm_state_dict['image_proj']
+        else:
+            state_dict = ipm_state_dict
+            
+        # 直接加载权重,不需要转换键值
+        image_proj_model.load_state_dict(state_dict)
         image_proj_model.to('cuda', torch.bfloat16)
         image_proj_model.eval()
         
-        # No need to load the ControlNet in this node, as it will be handled by the FLUX pipeline
-        
-        # Pack everything into a model dict
+        # 打包模型
         infu_model = {
-            "face_analyzers": {
-                "app_640": app_640,
-                "app_320": app_320,
-                "app_160": app_160
-            },
-            "arcface_model": arcface_model,
             "image_proj_model": image_proj_model,
             "model_version": model_version,
             "model_path": infu_model_path,
@@ -274,41 +248,46 @@ class ApplyInfu:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "infu_model": ("INFU_MODEL",),
-                "id_image": ("IMAGE",),
-                "width": ("INT", {"default": 864, "min": 512, "max": 2048, "step": 8}),
-                "height": ("INT", {"default": 1152, "min": 512, "max": 2048, "step": 8}),
+                "positive": ("CONDITIONING", ),
+                "negative": ("CONDITIONING", ),
+                "infu_model": ("INFU_MODEL", ),
+                "face_analyzers": ("INFU_FACEANALYSIS", ),
+                "id_image": ("IMAGE", ),
                 "infusenet_conditioning_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "infusenet_guidance_start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "infusenet_guidance_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
             "optional": {
-                "control_image": ("IMAGE",),
+                "control_image": ("IMAGE", ),
             }
         }
 
-    RETURN_TYPES = ("FLUX_CONTROLNET", "CONTROLNET_EMBEDS")
-    RETURN_NAMES = ("infusenet", "id_embeds")
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("positive", "negative")
     FUNCTION = "process"
     CATEGORY = "InfiniteYou"
 
-    def process(self, infu_model, id_image, width, height, infusenet_conditioning_scale, 
-                infusenet_guidance_start, infusenet_guidance_end, control_image=None):
+    def process(self, positive, negative, infu_model, face_analyzers, id_image,
+               infusenet_conditioning_scale, infusenet_guidance_start, 
+               infusenet_guidance_end, control_image=None):
         from diffusers.models import FluxControlNetModel
         
-        # Extract the components from the model dictionary
-        face_analyzers = infu_model["face_analyzers"]
-        arcface_model = infu_model["arcface_model"]
+        # 提取模型组件
         image_proj_model = infu_model["image_proj_model"]
         infusenet_path = infu_model["infusenet_path"]
         
-        # Load the InfuseNet ControlNet model
+        # 提取人脸分析器
+        app_640 = face_analyzers["app_640"]
+        app_320 = face_analyzers["app_320"]
+        app_160 = face_analyzers["app_160"]
+        arcface_model = face_analyzers["arcface_model"]
+        
+        # 加载 InfuseNet ControlNet 模型
         infusenet = FluxControlNetModel.from_pretrained(infusenet_path, torch_dtype=torch.bfloat16)
         infusenet.to("cuda")
         
-        # Convert tensor to PIL image for ID image
+        # 转换 ID 图像为 PIL 格式
         if isinstance(id_image, torch.Tensor):
-            # Convert from [B, H, W, C] to PIL
             if id_image.dim() == 4 and id_image.shape[0] == 1:
                 id_image = id_image.squeeze(0)
             
@@ -317,39 +296,39 @@ class ApplyInfu:
         else:
             id_image_pil = id_image
         
-        # Process ID image to extract embeddings
+        # 处理 ID 图像提取嵌入
         id_image_cv2 = cv2.cvtColor(np.array(id_image_pil), cv2.COLOR_RGB2BGR)
         
-        # Detect face using various scales if needed
-        face_info = face_analyzers["app_640"].get(id_image_cv2)
+        # 使用不同尺寸检测人脸
+        face_info = app_640.get(id_image_cv2)
         if len(face_info) == 0:
-            face_info = face_analyzers["app_320"].get(id_image_cv2)
+            face_info = app_320.get(id_image_cv2)
         if len(face_info) == 0:
-            face_info = face_analyzers["app_160"].get(id_image_cv2)
+            face_info = app_160.get(id_image_cv2)
         
         if len(face_info) == 0:
-            raise ValueError('No face detected in the input ID image')
+            raise ValueError('无法在输入的 ID 图像中检测到人脸')
             
-        # Use the largest face
+        # 使用最大的人脸
         face_info = sorted(face_info, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1]
         landmark = face_info['kps']
         
-        # Extract face embedding
+        # 提取人脸嵌入
         id_embed = extract_arcface_embedding(id_image_cv2, landmark, arcface_model)
         id_embed = id_embed.clone().unsqueeze(0).float().cuda()
         id_embed = id_embed.reshape([1, -1, 512])
         id_embed = id_embed.to(device='cuda', dtype=torch.bfloat16)
         
-        # Process through image projection model
+        # 通过图像投影模型处理
         with torch.no_grad():
             id_embed = image_proj_model(id_embed)
             bs_embed, seq_len, _ = id_embed.shape
             id_embed = id_embed.view(bs_embed, seq_len, -1)
             id_embed = id_embed.to(device='cuda', dtype=torch.bfloat16)
-        
-        # Process control image if provided
+
+        # 处理控制图像(如果提供)
         if control_image is not None:
-            # Convert tensor to PIL image for control image
+            # 转换控制图像为 PIL 格式
             if isinstance(control_image, torch.Tensor):
                 if control_image.dim() == 4 and control_image.shape[0] == 1:
                     control_image = control_image.squeeze(0)
@@ -360,30 +339,53 @@ class ApplyInfu:
                 control_image_pil = control_image
             
             control_image_pil = control_image_pil.convert("RGB")
-            control_image_pil = resize_and_pad_image(control_image_pil, (width, height))
             
-            # Detect face in control image
-            control_face_info = face_analyzers["app_640"].get(cv2.cvtColor(np.array(control_image_pil), cv2.COLOR_RGB2BGR))
+            # 在控制图像中检测人脸
+            control_face_info = app_640.get(cv2.cvtColor(np.array(control_image_pil), cv2.COLOR_RGB2BGR))
             if len(control_face_info) == 0:
-                print("Warning: No face detected in control image. Using black image instead.")
-                out_img = np.zeros([height, width, 3])
+                print("警告: 在控制图像中未检测到人脸。使用黑色图像代替。")
+                h, w = control_image_pil.size[::-1]
+                out_img = np.zeros([h, w, 3])
                 control_image_processed = Image.fromarray(out_img.astype(np.uint8))
             else:
-                # Use the largest face
+                # 使用最大的人脸
                 control_face_info = sorted(control_face_info, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1]
                 control_image_processed = draw_kps(control_image_pil, control_face_info['kps'])
         else:
-            # Create a black control image if none provided
-            out_img = np.zeros([height, width, 3])
+            # 如果没有提供控制图像,创建黑色图像
+            # 使用输入图像的尺寸
+            h, w = id_image_pil.size[::-1]
+            out_img = np.zeros([h, w, 3])
             control_image_processed = Image.fromarray(out_img.astype(np.uint8))
         
-        # Convert processed control image to tensor
+        # 转换处理后的控制图像为张量
         control_image_tensor = torch.from_numpy(np.array(control_image_processed)).float() / 255.0
         if control_image_tensor.dim() == 3:
             control_image_tensor = control_image_tensor.unsqueeze(0)
+
+        # 创建 conditioning
+        out = []
+        for conditioning in [positive, negative]:
+            c = []
+            for t in conditioning:
+                d = t[1].copy()
+                d['control'] = infusenet
+                d['control_apply_to_uncond'] = False
+                d['control_prompt_embeds'] = id_embed
+                d['control_conditioning_scale'] = infusenet_conditioning_scale
+                d['control_guidance_start'] = infusenet_guidance_start
+                d['control_guidance_end'] = infusenet_guidance_end
+                
+                # 添加 Advanced-ControlNet 兼容性
+                d['previous_controlnet'] = None  # 添加这个属性
+                d['control_model'] = infusenet  # 添加这个属性
+                d['control_image'] = control_image_tensor  # 添加这个属性
+                
+                n = [t[0], d]
+                c.append(n)
+            out.append(c)
         
-        # Return the InfuseNet model, ID embeddings, and processed control image
-        return (infusenet, id_embed)
+        return (out[0], out[1])
 
 
 # Node for creating InfiniteYou conditioning parameters
@@ -419,9 +421,75 @@ class InfuConditioningParams:
         return (conditioning,)
 
 
+
+
+class LoadInfuInsightFace:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "provider": (["CPU", "CUDA", "ROCM"], {"default": "CUDA"}),
+            },
+        }
+
+    RETURN_TYPES = ("INFU_FACEANALYSIS",)
+    FUNCTION = "load_insightface"
+    CATEGORY = "InfiniteYou"
+
+    def load_insightface(self, provider):
+        insightface_path = os.path.join(folder_paths.models_dir, "insightface")
+        # 确保路径存在
+        if not os.path.exists(insightface_path):
+            os.makedirs(insightface_path, exist_ok=True)
+            
+        # 设置执行提供者
+        providers = [f'{provider}ExecutionProvider']
+        if provider != "CPU":
+            providers.append('CPUExecutionProvider')
+            
+        # 加载不同尺寸的 face analyzers
+        app_640 = FaceAnalysis(
+            name='antelopev2',
+            root=insightface_path,
+            providers=providers
+        )
+        app_640.prepare(ctx_id=0, det_size=(640, 640))
+        
+        app_320 = FaceAnalysis(
+            name='antelopev2',
+            root=insightface_path,
+            providers=providers
+        )
+        app_320.prepare(ctx_id=0, det_size=(320, 320))
+        
+        app_160 = FaceAnalysis(
+            name='antelopev2',
+            root=insightface_path,
+            providers=providers
+        )
+        app_160.prepare(ctx_id=0, det_size=(160, 160))
+        
+        # 加载 ArcFace 模型
+        device = 'cuda' if provider in ['CUDA', 'ROCM'] else 'cpu'
+        arcface_model = init_recognition_model('arcface', device=device)
+        
+        # 打包所有分析器
+        face_analyzers = {
+            "app_640": app_640,
+            "app_320": app_320,
+            "app_160": app_160,
+            "arcface_model": arcface_model
+        }
+
+        print(f"InsightFace models loaded with {provider} provider")
+        return (face_analyzers,)
+    
+
+
 # Node mapping
 NODE_CLASS_MAPPINGS = {
     "LoadInfuModel": LoadInfuModel,
+    "LoadInfuInsightFace": LoadInfuInsightFace,
     "ApplyInfu": ApplyInfu,
     "InfuConditioningParams": InfuConditioningParams,
 }
@@ -429,6 +497,7 @@ NODE_CLASS_MAPPINGS = {
 # Node display names
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadInfuModel": "Load InfiniteYou Model",
+    "LoadInfuInsightFace": "Load InsightFace (InfiniteYou)",
     "ApplyInfu": "Apply InfiniteYou",
     "InfuConditioningParams": "InfiniteYou Conditioning Parameters",
 }
